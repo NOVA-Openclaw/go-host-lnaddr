@@ -3,9 +3,12 @@ package invoice
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -120,6 +123,7 @@ type testHarness struct {
 
 func newTestHarness(t *testing.T,
 	setup func(ctx context.Context) *fakeLightningClient,
+	preStart func(*testHarness),
 	backoff func(int) time.Duration) *testHarness {
 
 	t.Helper()
@@ -144,6 +148,13 @@ func newTestHarness(t *testing.T,
 	}
 	h.handler.publishZapReceipt = func(r *zapReceipt) {
 		h.zaps <- r
+	}
+
+	// Let the caller perform any registrations before the stream starts
+	// receiving events. This eliminates races between registration and the
+	// first stream delivery.
+	if preStart != nil {
+		preStart(h)
 	}
 
 	h.wg.Add(1)
@@ -246,9 +257,10 @@ func TestSettlementHandler_BaselineHappyPath(t *testing.T) {
 		return &fakeLightningClient{calls: []*subscribeCall{
 			{stream: newFakeStream(ctx, streamEvent{invoice: settledInvoice(1, rHash, 21)})},
 		}}
+	}, func(h *testHarness) {
+		h.register(rHash, "hello", nil)
 	}, nil)
 	defer h.stop()
-	h.register(rHash, "hello", nil)
 
 	rec, ok := waitForNotification(t, h.notifications, time.Second)
 	if !ok {
@@ -280,10 +292,11 @@ func TestSettlementHandler_NoMissNoDuplicate_AdvancesSettleIndex(t *testing.T) {
 				streamEvent{invoice: settledInvoice(2, rHashB, 200)},
 			)},
 		}}
+	}, func(h *testHarness) {
+		h.register(rHashA, "A", nil)
+		h.register(rHashB, "B", nil)
 	}, func(int) time.Duration { return time.Millisecond })
 	defer h.stop()
-	h.register(rHashA, "A", nil)
-	h.register(rHashB, "B", nil)
 
 	recA, ok := waitForNotification(t, h.notifications, time.Second)
 	if !ok {
@@ -333,9 +346,10 @@ func TestSettlementHandler_UnregisteredInvoiceIgnored(t *testing.T) {
 				streamEvent{invoice: settledInvoice(2, rHashForeign, 99)},
 			)},
 		}}
+	}, func(h *testHarness) {
+		h.register(rHashKnown, "known", nil)
 	}, nil)
 	defer h.stop()
-	h.register(rHashKnown, "known", nil)
 
 	rec, ok := waitForNotification(t, h.notifications, time.Second)
 	if !ok {
@@ -378,11 +392,12 @@ func TestSettlementHandler_MixedOutcomesAcrossDisconnect(t *testing.T) {
 				streamEvent{invoice: settledInvoice(2, rHashB, 20)},
 			)},
 		}}
+	}, func(h *testHarness) {
+		h.register(rHashA, "A", nil)
+		h.register(rHashB, "B", nil)
+		h.register(rHashC, "C", nil)
 	}, func(int) time.Duration { return time.Millisecond })
 	defer h.stop()
-	h.register(rHashA, "A", nil)
-	h.register(rHashB, "B", nil)
-	h.register(rHashC, "C", nil)
 
 	got := make(map[string]callbackRecord)
 	for i := 0; i < 2; i++ {
@@ -413,9 +428,10 @@ func TestSettlementHandler_DuplicateDeliveryDeduped(t *testing.T) {
 				streamEvent{invoice: settledInvoice(1, rHash, 42)},
 			)},
 		}}
+	}, func(h *testHarness) {
+		h.register(rHash, "dup", nil)
 	}, nil)
 	defer h.stop()
-	h.register(rHash, "dup", nil)
 
 	rec, ok := waitForNotification(t, h.notifications, time.Second)
 	if !ok {
@@ -440,7 +456,7 @@ func TestSettlementHandler_EOFCausesReconnect(t *testing.T) {
 			{stream: newFakeStream(ctx, streamEvent{err: io.EOF})},
 			{stream: newFakeStream(ctx)},
 		}}
-	}, func(int) time.Duration { return time.Millisecond })
+	}, nil, func(int) time.Duration { return time.Millisecond })
 	defer h.stop()
 
 	for len(h.client.SubscriptionRequests()) < 2 {
@@ -458,7 +474,7 @@ func TestSettlementHandler_UnavailableCausesReconnect(t *testing.T) {
 			{stream: newFakeStream(ctx, streamEvent{err: status.Error(codes.Unavailable, "boom")})},
 			{stream: newFakeStream(ctx)},
 		}}
-	}, func(int) time.Duration { return time.Millisecond })
+	}, nil, func(int) time.Duration { return time.Millisecond })
 	defer h.stop()
 
 	for len(h.client.SubscriptionRequests()) < 2 {
@@ -476,7 +492,7 @@ func TestSettlementHandler_ServerCanceledCausesReconnect(t *testing.T) {
 			{stream: newFakeStream(ctx, streamEvent{err: status.Error(codes.Canceled, "server gone")})},
 			{stream: newFakeStream(ctx)},
 		}}
-	}, func(int) time.Duration { return time.Millisecond })
+	}, nil, func(int) time.Duration { return time.Millisecond })
 	defer h.stop()
 
 	for len(h.client.SubscriptionRequests()) < 2 {
@@ -493,7 +509,7 @@ func TestSettlementHandler_OwnCtxCancelExits(t *testing.T) {
 		return &fakeLightningClient{calls: []*subscribeCall{
 			{stream: newFakeStream(ctx)},
 		}}
-	}, nil)
+	}, nil, nil)
 	defer h.stop()
 
 	time.Sleep(20 * time.Millisecond)
@@ -520,9 +536,10 @@ func TestSettlementHandler_SubscribeErrorRetriesThenRecovers(t *testing.T) {
 			{err: errors.New("lnd transient")},
 			{stream: newFakeStream(ctx, streamEvent{invoice: settledInvoice(1, []byte{1}, 5)})},
 		}}
+	}, func(h *testHarness) {
+		h.register([]byte{1}, "recovered", nil)
 	}, func(int) time.Duration { return time.Millisecond })
 	defer h.stop()
-	h.register([]byte{1}, "recovered", nil)
 
 	_, ok := waitForNotification(t, h.notifications, time.Second)
 	if !ok {
@@ -552,6 +569,8 @@ func TestSettlementHandler_BackoffBoundsAndReset(t *testing.T) {
 			)},
 			{stream: newFakeStream(ctx)},
 		}}
+	}, func(h *testHarness) {
+		h.register([]byte{1}, "x", nil)
 	}, func(attempt int) time.Duration {
 		mu.Lock()
 		attempts = append(attempts, attempt)
@@ -559,7 +578,6 @@ func TestSettlementHandler_BackoffBoundsAndReset(t *testing.T) {
 		return time.Millisecond
 	})
 	defer h.stop()
-	h.register([]byte{1}, "x", nil)
 
 	_, ok := waitForNotification(t, h.notifications, time.Second)
 	if !ok {
@@ -605,7 +623,7 @@ func TestSettlementHandler_RapidFlapping(t *testing.T) {
 			calls[i] = &subscribeCall{stream: newFakeStream(ctx, streamEvent{err: io.EOF})}
 		}
 		return &fakeLightningClient{calls: calls}
-	}, func(int) time.Duration { return delay })
+	}, nil, func(int) time.Duration { return delay })
 	defer h.stop()
 
 	start := time.Now()
@@ -633,7 +651,7 @@ func TestSettlementHandler_ShutdownWhileBlockedInRecv(t *testing.T) {
 		return &fakeLightningClient{calls: []*subscribeCall{
 			{stream: newFakeStream(ctx)}, // blocks forever until ctx canceled
 		}}
-	}, nil)
+	}, nil, nil)
 	defer h.stop()
 
 	time.Sleep(20 * time.Millisecond)
@@ -660,7 +678,7 @@ func TestSettlementHandler_ShutdownMidBackoff(t *testing.T) {
 		return &fakeLightningClient{calls: []*subscribeCall{
 			{err: errors.New("boom")},
 		}}
-	}, func(int) time.Duration { return time.Hour })
+	}, nil, func(int) time.Duration { return time.Hour })
 	defer h.stop()
 
 	time.Sleep(20 * time.Millisecond)
@@ -739,10 +757,11 @@ func TestSettlementHandler_ShutdownWithUnsettledRegistrations(t *testing.T) {
 		return &fakeLightningClient{calls: []*subscribeCall{
 			{stream: newFakeStream(ctx)},
 		}}
+	}, func(h *testHarness) {
+		h.register([]byte{1}, "unsettled", nil)
+		h.register([]byte{2}, "also unsettled", nil)
 	}, nil)
 	defer h.stop()
-	h.register([]byte{1}, "unsettled", nil)
-	h.register([]byte{2}, "also unsettled", nil)
 
 	noNotification(t, h.notifications, 100*time.Millisecond)
 }
@@ -904,5 +923,201 @@ func TestSettlementHandler_ZapReceiptPublished(t *testing.T) {
 	}
 	if rec.event.Kind != nostr.KindZap {
 		t.Fatalf("unexpected kind %d", rec.event.Kind)
+	}
+}
+
+// --- Regression test: fast-settlement race -----------------------------
+
+// channelStream is a fake SubscribeInvoices stream whose events are delivered
+// on demand through a channel. It is used by TestSettlementHandler_FastSettlementBeforeRegister
+// to inject a SETTLED event at a precise moment.
+type channelStream struct {
+	ctx     context.Context
+	deliver chan *lnrpc.Invoice
+}
+
+func newChannelStream(ctx context.Context) *channelStream {
+	return &channelStream{
+		ctx:     ctx,
+		deliver: make(chan *lnrpc.Invoice, 1),
+	}
+}
+
+func (c *channelStream) Recv() (*lnrpc.Invoice, error) {
+	select {
+	case inv := <-c.deliver:
+		return inv, nil
+	case <-c.ctx.Done():
+		return nil, c.ctx.Err()
+	}
+}
+
+func (c *channelStream) Header() (metadata.MD, error) { return metadata.MD{}, nil }
+func (c *channelStream) Trailer() metadata.MD         { return metadata.MD{} }
+func (c *channelStream) CloseSend() error             { return nil }
+func (c *channelStream) Context() context.Context     { return c.ctx }
+func (c *channelStream) SendMsg(m interface{}) error  { return nil }
+func (c *channelStream) RecvMsg(m interface{}) error  { return nil }
+
+// raceLightningClient is a minimal fake that supports AddInvoice and
+// SubscribeInvoices. AddInvoice records the preimage it received and signals
+// when it is invoked so the test can time the settlement injection.
+type raceLightningClient struct {
+	lnrpc.LightningClient
+	stream         *channelStream
+	paymentRequest string
+
+	mu                 sync.Mutex
+	lastRPreimage      []byte
+	addInvoiceCalledCh chan struct{}
+}
+
+func newRaceLightningClient(stream *channelStream) *raceLightningClient {
+	return &raceLightningClient{
+		stream:             stream,
+		paymentRequest:     "lnbc1testpr",
+		addInvoiceCalledCh: make(chan struct{}),
+	}
+}
+
+func (f *raceLightningClient) AddInvoice(_ context.Context, in *lnrpc.Invoice,
+	_ ...grpc.CallOption) (*lnrpc.AddInvoiceResponse, error) {
+
+	f.mu.Lock()
+	f.lastRPreimage = in.RPreimage
+	f.mu.Unlock()
+	close(f.addInvoiceCalledCh)
+
+	// Return the rHash that corresponds to the preimage so the legacy path
+	// (AddInvoice before register) registers the same value the stream will
+	// deliver.
+	rHash := sha256.Sum256(in.RPreimage)
+	return &lnrpc.AddInvoiceResponse{
+		PaymentRequest: f.paymentRequest,
+		RHash:          rHash[:],
+	}, nil
+}
+
+func (f *raceLightningClient) SubscribeInvoices(ctx context.Context,
+	_ *lnrpc.InvoiceSubscription, _ ...grpc.CallOption) (
+	lnrpc.Lightning_SubscribeInvoicesClient, error) {
+
+	return f.stream, nil
+}
+
+func (f *raceLightningClient) lastPreimage() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastRPreimage
+}
+
+// TestSettlementHandler_FastSettlementBeforeRegister deterministically forces
+// the race where LND delivers SETTLED for an rHash before HandleInvoiceCreation
+// has finished registering it. On the buggy code AddInvoice runs first, so the
+// stream can deliver SETTLED while register is still in flight and the event is
+// dropped. After the fix registration happens before AddInvoice, so the rHash
+// is already tracked when the settlement arrives.
+func TestSettlementHandler_FastSettlementBeforeRegister(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	SetLogger(testDiscardLogger(t))
+
+	fixedPreimage := bytes.Repeat([]byte{0x11}, 32)
+	expectedRHash := sha256.Sum256(fixedPreimage)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream := newChannelStream(ctx)
+	client := newRaceLightningClient(stream)
+
+	sh := NewSettlementHandler(client, "")
+	notified := make(chan callbackRecord, 1)
+	sh.broadcastNotification = func(amt uint64, comment string) {
+		notified <- callbackRecord{amount: amt, comment: comment}
+	}
+	sh.publishZapReceipt = func(*zapReceipt) {}
+
+	// Hook installed before the registration is stored. It lets the test
+	// observe when register() is in progress and inject the settlement at the
+	// critical moment.
+	registerStarted := make(chan struct{})
+	registerProceed := make(chan struct{})
+	sh.beforeRegisterTestHook = func() {
+		close(registerStarted)
+		<-registerProceed
+	}
+
+	// Signal fired after handleInvoice finishes processing a SETTLED invoice,
+	// whether the invoice was registered or not. This lets the test wait for
+	// the forced settlement to be observed before allowing register() to
+	// complete on the legacy path.
+	settlementHandled := make(chan struct{}, 1)
+	sh.settlementHandledTestHook = settlementHandled
+
+	mgr := NewInvoiceManager(&ManagerConfig{
+		LndClient:         client,
+		SettlementHandler: sh,
+	})
+	mgr.generatePreimage = func() ([]byte, error) {
+		return fixedPreimage, nil
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sh.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	// Drive the settlement injection from a separate goroutine. It adapts to
+	// whichever ordering it observes:
+	//   - Legacy (AddInvoice before register): wait for AddInvoice, wait for
+	//     register to reach the hook, deliver SETTLED while register is blocked
+	//     before storing, wait for handleInvoice to observe the dropped event,
+	//     then let register finish. The event is unregistered.
+	//   - Fixed (register before AddInvoice): wait for register to reach the
+	//     hook, let it finish and AddInvoice run, then deliver SETTLED. The
+	//     event is registered.
+	go func() {
+		select {
+		case <-client.addInvoiceCalledCh:
+			// Legacy path: AddInvoice already returned, register is next.
+			<-registerStarted
+			stream.deliver <- settledInvoice(1, expectedRHash[:], 21)
+			<-settlementHandled
+			close(registerProceed)
+
+		case <-registerStarted:
+			// Fixed path: register reached the hook before AddInvoice. Let it
+			// complete and AddInvoice run, then deliver the settlement.
+			close(registerProceed)
+			<-client.addInvoiceCalledCh
+			stream.deliver <- settledInvoice(1, expectedRHash[:], 21)
+		}
+	}()
+
+	req := httptest.NewRequest(http.MethodGet, "/invoice/?amount=21000", nil)
+	rec := httptest.NewRecorder()
+	mgr.HandleInvoiceCreation(Config{
+		MinSendableMsat: 1,
+		MaxSendableMsat: 100_000_000,
+		SuccessMessage:  "ok",
+	})(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", rec.Code)
+	}
+
+	select {
+	case rec := <-notified:
+		if rec.amount != 21 || rec.comment != "" {
+			t.Fatalf("unexpected notification: %+v", rec)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("settlement notification was lost; fast-settlement race still present")
 	}
 }

@@ -69,6 +69,19 @@ type SettlementHandler struct {
 	// backoff returns the duration to wait before reconnect attempt i.
 	// Injectable for tests so they don't sleep for real.
 	backoff func(attempt int) time.Duration
+
+	// beforeRegisterTestHook is a test-only seam. When non-nil it is called
+	// at the start of subscribeInvoiceSettlements before the registration is
+	// stored. It can be used to force the fast-settlement race where the
+	// stream delivers SETTLED before registration completes.
+	beforeRegisterTestHook func()
+
+	// settlementHandledTestHook is a test-only seam. When non-nil it receives
+	// a value after handleInvoice has finished processing any SETTLED invoice,
+	// whether the invoice was registered or not. This lets tests synchronize
+	// on the exact moment a forced settlement has been observed by the
+	// handler.
+	settlementHandledTestHook chan<- struct{}
 }
 
 func NewSettlementHandler(
@@ -127,6 +140,10 @@ func (s *SettlementHandler) subscribeInvoiceSettlements(ctx context.Context,
 		return err
 	}
 
+	if s.beforeRegisterTestHook != nil {
+		s.beforeRegisterTestHook()
+	}
+
 	s.mu.Lock()
 	s.registrations[hex.EncodeToString(rHash)] = &settlementRegistration{
 		rHash:      rHash,
@@ -136,6 +153,15 @@ func (s *SettlementHandler) subscribeInvoiceSettlements(ctx context.Context,
 	s.mu.Unlock()
 
 	return nil
+}
+
+// unsubscribeInvoiceSettlements removes a previously registered rHash from
+// settlement tracking. It is used to clean up if invoice creation fails after
+// registration but before the invoice exists in LND.
+func (s *SettlementHandler) unsubscribeInvoiceSettlements(rHash []byte) {
+	s.mu.Lock()
+	delete(s.registrations, hex.EncodeToString(rHash))
+	s.mu.Unlock()
 }
 
 // Run starts the persistent SubscribeInvoices stream. It blocks until ctx is
@@ -216,6 +242,12 @@ func (s *SettlementHandler) handleInvoice(invoice *lnrpc.Invoice) {
 	}
 
 	if invoice.SettleIndex > s.lastProcessedSettleIndex {
+		// Advance the cursor before invoking callbacks. This is safe today
+		// because handleInvoice runs in a single sequential goroutine (Run's
+		// recv loop), so the index cannot advance concurrently with callback
+		// execution. A future refactor that parallelizes handling must either
+		// keep this ordering atomic with callback completion or accept the
+		// risk of duplicate delivery after a reconnect.
 		s.lastProcessedSettleIndex = invoice.SettleIndex
 	}
 
@@ -228,11 +260,13 @@ func (s *SettlementHandler) handleInvoice(invoice *lnrpc.Invoice) {
 	if !ok {
 		log.Warnf("settlement for unregistered invoice rHash=%s "+
 			"settle_index=%d", rHashHex, invoice.SettleIndex)
+		s.signalSettlementHandledTestHook()
 		return
 	}
 
 	if reg.notified {
 		// Handler-level dedup: already delivered for this rHash.
+		s.signalSettlementHandledTestHook()
 		return
 	}
 	reg.notified = true
@@ -252,6 +286,17 @@ func (s *SettlementHandler) handleInvoice(invoice *lnrpc.Invoice) {
 			log.Infof("Publishing zap receipt: %+v",
 				reg.zapReceipt.event)
 			s.publishZapReceipt(reg.zapReceipt)
+		}
+	}
+
+	s.signalSettlementHandledTestHook()
+}
+
+func (s *SettlementHandler) signalSettlementHandledTestHook() {
+	if s.settlementHandledTestHook != nil {
+		select {
+		case s.settlementHandledTestHook <- struct{}{}:
+		default:
 		}
 	}
 }

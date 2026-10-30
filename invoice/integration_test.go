@@ -21,6 +21,17 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// rHashFromRPreimage returns the SHA256 of the preimage when one is provided,
+// otherwise it returns a deterministic fallback for tests that do not set
+// RPreimage.
+func rHashFromRPreimage(preimage []byte) []byte {
+	if len(preimage) == 32 {
+		h := sha256.Sum256(preimage)
+		return h[:]
+	}
+	return []byte{1, 2, 3, 4}
+}
+
 // mockLightningClient is a minimal test double for lnrpc.LightningClient.
 // It records AddInvoice calls and returns deterministic values.
 type mockLightningClient struct {
@@ -41,7 +52,7 @@ func (f *mockLightningClient) AddInvoice(_ context.Context, in *lnrpc.Invoice,
 	}
 	return &lnrpc.AddInvoiceResponse{
 		PaymentRequest: "lnbc1testpr",
-		RHash:          []byte{1, 2, 3, 4},
+		RHash:          rHashFromRPreimage(in.RPreimage),
 	}, nil
 }
 

@@ -1,7 +1,9 @@
 package invoice
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -56,6 +58,10 @@ func badRequestError(w http.ResponseWriter, reason string,
 // Manager coordinates invoice creation and related concerns.
 type Manager struct {
 	Cfg *ManagerConfig
+
+	// generatePreimage is a test seam. It returns a 32-byte preimage used to
+	// derive the invoice rHash. In production it defaults to crypto/rand.
+	generatePreimage func() ([]byte, error)
 }
 
 type ManagerConfig struct {
@@ -79,6 +85,11 @@ type zapReceipt struct {
 func NewInvoiceManager(cfg *ManagerConfig) *Manager {
 	return &Manager{
 		Cfg: cfg,
+		generatePreimage: func() ([]byte, error) {
+			preimage := make([]byte, 32)
+			_, err := rand.Read(preimage)
+			return preimage, err
+		},
 	}
 }
 
@@ -243,8 +254,31 @@ func (m *Manager) HandleInvoiceCreation(config Config) http.HandlerFunc {
 		h := sha256.Sum256([]byte(invoiceParams.Description))
 		invoiceParams.DescriptionHash = h[:]
 
-		bolt11, r_hash, err := m.MakeInvoice(invoiceParams)
+		preimage, err := m.generatePreimage()
 		if err != nil {
+			log.Infof("Cannot generate invoice preimage: %s", err)
+			badRequestError(w, "Invoice creation failed.")
+			return
+		}
+		rHash := sha256.Sum256(preimage)
+
+		// Register the rHash for settlement tracking BEFORE calling AddInvoice.
+		// The persistent settlement stream is already running and can deliver
+		// SETTLED as soon as LND accepts the invoice; registering first closes
+		// the window where a fast settlement is treated as unregistered and
+		// dropped. If AddInvoice fails we clean up the registration so it does
+		// not leak.
+		if err := m.Cfg.SettlementHandler.subscribeInvoiceSettlements(
+			context.Background(), rHash[:], comment, zapReceipt,
+		); err != nil {
+			log.Infof("Cannot register invoice settlement: %s", err)
+			badRequestError(w, "Invoice creation failed.")
+			return
+		}
+
+		bolt11, _, err := m.MakeInvoice(invoiceParams, preimage)
+		if err != nil {
+			m.Cfg.SettlementHandler.unsubscribeInvoiceSettlements(rHash[:])
 			log.Infof("Cannot create invoice: %s", err)
 			badRequestError(w, "Invoice creation failed.")
 			return
@@ -265,22 +299,25 @@ func (m *Manager) HandleInvoiceCreation(config Config) http.HandlerFunc {
 				Message: config.SuccessMessage,
 			},
 		}
-		m.Cfg.SettlementHandler.subscribeInvoiceSettlements(
-			context.Background(), r_hash, comment, zapReceipt,
-		)
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(invoice)
 	}
 }
 
-func (m *Manager) MakeInvoice(params Params) (string, []byte,
+func (m *Manager) MakeInvoice(params Params, preimage []byte) (string, []byte,
 	error) {
 
+	if len(preimage) != 32 {
+		return "", nil, fmt.Errorf("preimage must be 32 bytes, got %d", len(preimage))
+	}
+
+	rHash := sha256.Sum256(preimage)
 	invoice := &lnrpc.Invoice{
 		ValueMsat:       params.Msat,
 		Memo:            params.Description,
 		DescriptionHash: params.DescriptionHash,
 		Private:         params.PrivateRouteHints,
+		RPreimage:       preimage,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -292,5 +329,10 @@ func (m *Manager) MakeInvoice(params Params) (string, []byte,
 		return "", nil, err
 	}
 
-	return resp.PaymentRequest, resp.RHash, nil
+	if !bytes.Equal(resp.RHash, rHash[:]) {
+		return "", nil, fmt.Errorf("rHash mismatch: lnd returned %x, expected %x",
+			resp.RHash, rHash[:])
+	}
+
+	return resp.PaymentRequest, rHash[:], nil
 }
