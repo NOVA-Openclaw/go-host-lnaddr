@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -154,6 +155,10 @@ func main() {
 			SettlementHandler: settlementHandler,
 		},
 	)
+
+	// Start the persistent settlement stream. It reconnects automatically
+	// on transient errors and exits when the process shuts down.
+	go settlementHandler.Run(context.Background())
 
 	setupHandlerPerAddress(config)
 	setupNostrHandlers(config.Nostr)

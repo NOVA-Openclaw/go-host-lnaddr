@@ -12,6 +12,7 @@ require (
 	github.com/lightningnetwork/lnd v0.19.3-beta
 	github.com/nbd-wtf/go-nostr v0.51.12
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+	go.uber.org/goleak v1.3.0
 	google.golang.org/grpc v1.59.0
 	gopkg.in/macaroon.v2 v2.1.0
 )
