@@ -23,10 +23,11 @@ func SetLogger(l btclog.Logger) { log = l }
 
 // Config is the minimal configuration the invoice handler needs.
 type Config struct {
-	MinSendableMsat  int
-	MaxSendableMsat  int
-	MaxCommentLength int
-	SuccessMessage   string
+	MinSendableMsat   int
+	MaxSendableMsat   int
+	MaxCommentLength  int
+	SuccessMessage    string
+	PrivateRouteHints bool
 }
 
 // Invoice is the JSON response for a created invoice.
@@ -63,9 +64,10 @@ type ManagerConfig struct {
 }
 
 type Params struct {
-	Msat            int64
-	Description     string
-	DescriptionHash []byte
+	Msat              int64
+	Description       string
+	DescriptionHash   []byte
+	PrivateRouteHints bool
 }
 
 type zapReceipt struct {
@@ -233,8 +235,9 @@ func (m *Manager) HandleInvoiceCreation(config Config) http.HandlerFunc {
 
 		// parameters ok, creating invoice
 		invoiceParams := Params{
-			Msat:        int64(mSat),
-			Description: metadata,
+			Msat:              int64(mSat),
+			Description:       metadata,
+			PrivateRouteHints: config.PrivateRouteHints,
 		}
 
 		h := sha256.Sum256([]byte(invoiceParams.Description))
@@ -277,6 +280,7 @@ func (m *Manager) MakeInvoice(params Params) (string, []byte,
 		ValueMsat:       params.Msat,
 		Memo:            params.Description,
 		DescriptionHash: params.DescriptionHash,
+		Private:         params.PrivateRouteHints,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
