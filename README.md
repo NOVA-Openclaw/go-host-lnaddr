@@ -63,6 +63,8 @@ Thumbnail = "/path/to/thumbnail.[jpeg|png]"
 SuccessMessage = "Thank you!"
 InvoiceCallback = "https://sendmesats.com/invoice/"
 AddressServerPort = 9990
+# When true, LND includes private route hints in invoices. Default false.
+PrivateRouteHints = false
 
 [Nostr]
   [Nostr.names]

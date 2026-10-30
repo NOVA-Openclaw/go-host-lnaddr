@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -52,7 +53,11 @@ type ServerConfig struct {
 	// Notificators is the old name for Notifiers, left here for
 	// backwards compatibility.
 	Notificators []notifier.Config `json:"Notificators" toml:"Notificators"`
-	Zaps         *ZapsConfig       `json:"Zaps" toml:"Zaps"`
+	Zaps              *ZapsConfig       `json:"Zaps" toml:"Zaps"`
+	// PrivateRouteHints sets invoice.Private when calling LND AddInvoice.
+	// When true, LND includes private route hints in the generated invoice.
+	// Default is false to preserve upstream behavior.
+	PrivateRouteHints bool `json:"PrivateRouteHints" toml:"PrivateRouteHints"`
 }
 
 type LNUrlPay struct {
@@ -151,6 +156,10 @@ func main() {
 		},
 	)
 
+	// Start the persistent settlement stream. It reconnects automatically
+	// on transient errors and exits when the process shuts down.
+	go settlementHandler.Run(context.Background())
+
 	setupHandlerPerAddress(config)
 	setupNostrHandlers(config.Nostr)
 	if config.Notificators != nil && config.Notifiers == nil {
@@ -167,10 +176,11 @@ func main() {
 		log.Warnf("Unable to convert metadata to string: %v", err)
 	}
 	payCfg := invoice.Config{
-		MinSendableMsat:  config.MinSendableMsat,
-		MaxSendableMsat:  config.MaxSendableMsat,
-		MaxCommentLength: config.MaxCommentLength,
-		SuccessMessage:   config.SuccessMessage,
+		MinSendableMsat:   config.MinSendableMsat,
+		MaxSendableMsat:   config.MaxSendableMsat,
+		MaxCommentLength:  config.MaxCommentLength,
+		SuccessMessage:    config.SuccessMessage,
+		PrivateRouteHints: config.PrivateRouteHints,
 	}
 	http.HandleFunc("/invoice/", useLogger(
 		invoiceManager.HandleInvoiceCreation(payCfg),
