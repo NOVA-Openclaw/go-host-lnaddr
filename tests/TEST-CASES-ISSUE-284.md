@@ -262,6 +262,11 @@ This group is a post-deploy checklist run once, by a human or supervised agent, 
 sudo restart. Every step is decode-only / read-only against the live node. **No invoice in this
 group is ever paid.**
 
+**Restart-window caveat (see Group I):** any zap invoice issued before Graybeard's restart and
+settled during or after the restart window falls under Group I's accepted-loss behavior (I1) — no
+zap receipt is expected for it, and this checklist does not attempt to verify that (no payments).
+This is expected behavior, not a regression to investigate.
+
 **D1 — Decode a fresh invoice from `nova@<domain>`**
 Request one invoice (HTTP `GET /invoice/?amount=...`, no payment), decode the returned bolt11 with
 a read-only decoder (`lncli decodepayreq` or equivalent). Expected: `route_hints` is present and
@@ -454,6 +459,63 @@ status as a side effect.
 
 ---
 
+### Group I — Settlement stream: process restart (Plan item 2 extension, AC3 restart edge case)
+
+Project Leadership review (step 4 gap): the invoice registry (in-memory `rHash` → callback/zap-request
+mapping) and the settlement handler's connection state live only in process memory. The deploy step
+itself restarts `lnaddr-nova`/`lnaddr-valid` — so an invoice created before that restart and settled
+after it (or during the restart window) is a real, not hypothetical, case every deploy. These TCs pin
+the chosen behavior so it's a documented decision, not an accident of whatever the refactor happens to
+do.
+
+**I1 — Settlement for an invoice created before a process restart — CHOSEN BEHAVIOR: accepted loss**
+Setup: invoice X is created and registered (rHash → callback) in process instance P1; P1 is stopped
+(simulating the deploy restart) before X settles; a fresh process instance P2 starts with an empty
+in-memory registry (no prior registration carries over) and begins its settlement subscription per
+I2's rule; X then settles.
+Expected: P2 has no registered callback for X's `rHash`, so no zap receipt is published for X — this
+loss is accepted and documented, not silently swallowed. If P2's settlement stream observes X settling
+(e.g., it appears in whatever backlog/notification P2 receives) with no matching registration, the
+handler logs a **WARN** including X's `rHash` (reusing the F5 "unregistered rHash" no-crash path, with
+the addition of the WARN log so the drop is observable in `journalctl`/logs rather than silent) and
+does **not** panic or crash. Strict.
+
+**Recommendation: accepted loss (documented), not persisted-index recovery — with reasoning:**
+Recovery via persisted index + `LookupInvoice` was considered and rejected *for this issue's scope*.
+The `SettleIndex` is only half the state needed to actually deliver a zap receipt: `publishZapReceipt`
+needs the original nostr zap-request JSON, relay list, and description hash that were only ever held
+in the in-memory registry entry created at invoice-creation time — none of that is in LND's own
+`LookupInvoice` response. Recovering real zap-receipt delivery across a restart would require a new
+persistence layer for invoice-creation metadata (not just an index), keyed durably by `rHash`, written
+synchronously enough to survive an unexpected crash (not just a planned restart) — that's materially
+more surface area than this issue (#284, route hints + reconnect logging) asked for, and risks the
+same kind of half-finished-durability bug this issue exists to fix in the stream layer. Accepted loss
+is also honest about the actual failure mode today (pre-fix, ALL restarts silently lose in-flight
+settlements with no log at all) — the fix only needs to make the loss *visible and bounded* (WARN +
+rHash), not eliminate it. I recommend tracking full persisted recovery as an explicit **follow-up
+issue** (new in-memory-registry-survives-restart ticket), separate from #284.
+
+**I2 — First subscription after process start does not replay old settlements as new notifications**
+Setup: invoice Y settles and its callback fires (zap receipt published) in process instance P1,
+*before* a restart; P1 stops; process instance P2 starts fresh (empty registry, per I1) and opens its
+first `SubscribeInvoices` call.
+Expected: Y's settlement is not re-delivered to P2 as a "new" notification that fires a second
+callback/zap receipt — P2 has no registration for Y regardless (satisfies this trivially under I1's
+accepted-loss design, since `SettleIndex` starts at a value that does not replay P1's already-handled
+backlog as actionable for P2), but assert it explicitly: this is the concrete regression this group
+exists to prevent, and it must hold even if a future follow-up (persisted-index recovery, per I1's
+recommendation) changes the subscribe-time `SettleIndex` — a persisted index must advance *past*
+already-notified settlements, not just past the start of the process. Strict.
+
+**I3 — Group D's deploy-window check documents the expected zap-receipt gap (see Group D note, no new assertion)**
+Not a new automated test: a cross-reference confirming Group D's manual checklist, which runs
+immediately after Graybeard's restart, explicitly expects and documents (rather than treats as a
+surprise) that any zap invoice issued before the restart and paid during or after the restart window
+falls under I1's accepted-loss behavior. See the note added to the Group D header. Informational —
+documentation cross-check only, not an executable TC.
+
+---
+
 ## TC Count by Area
 
 | Group | Area | Count | Automated? |
@@ -466,7 +528,8 @@ status as a side effect.
 | F | Settlement stream dedup / no-miss | 7 | Yes (fake stream/client) |
 | G | Graceful shutdown / goroutine hygiene | 5 | Yes (goleak / NumGoroutine) |
 | H | systemd unit files | 7 | No — manual, read-only host checks |
-| **Total** | | **73** | 59 automatable in `go test ./...`, 14 manual/host checklist |
+| I | Settlement stream: process restart | 3 | Partial — I1/I2 Go unit tests (fresh handler instance, empty in-memory registry), I3 manual/deploy-note only |
+| **Total** | | **76** | 61 automatable in `go test ./...`, 15 manual/host checklist |
 
 ## Done Criteria
 
@@ -542,3 +605,14 @@ confirms end-to-end routing.
   verification TC, NO payments") — I did not propose scripting/automating the Olympus decode check
   into CI, since that would require live LND/node credentials in a test runner, which the no-spend,
   no-live-LND constraints for this suite rule out.
+- **Process restart (Group I): invoice registry loss is accepted, not silently hidden.** The deploy
+  step restarts `lnaddr-nova`/`lnaddr-valid`, and the in-memory `rHash → callback` registry (plus the
+  zap-request metadata needed to actually publish a receipt) does not survive that. I recommend (I1)
+  documenting this as an accepted loss — WARN-level log with the `rHash` if the drop is observed, no
+  panic — rather than building persisted-index + `LookupInvoice` recovery now. Full recovery needs to
+  persist invoice-creation metadata (zap-request JSON, relay list), not just LND's `SettleIndex`,
+  which is a materially bigger durability project than this issue's scope; I've flagged it as a
+  follow-up issue rather than folding it into #284's done-criteria. I2 guards the inverse risk (a
+  future persisted-index fix accidentally replaying already-notified settlements as duplicates after
+  restart), and I3 just makes sure Group D's post-restart manual checklist doesn't mistake the
+  accepted gap for a bug.
